@@ -1,0 +1,43 @@
+# --- Vim ---
+*.swp
+*.swo
+*.swx
+
+# --- Build artifacts ---
+*.o
+*.a
+*.so
+*.lo
+*.la
+*.obj
+*.exe
+*.out
+*.app
+*.dll
+
+# --- Binaries ---
+blockmon
+blockmon_test
+*.bin
+
+# --- Core dumps / debug ---
+core
+*.core
+*.dSYM/
+*.stackdump
+*.gdb_history
+
+# --- Build directories ---
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+/Makefile
+cmake_install.cmake
+
+# --- Logs ---
+*.log
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+
