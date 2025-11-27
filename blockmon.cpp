@@ -14,7 +14,21 @@
 #include <poll.h>
 #include <cstdint>
 
-static const char* DEFAULT_STATE_DIR = "/etc/telegraf";
+// Prometheus client
+#include <prometheus/exposer.h>
+#include <prometheus/registry.h>
+#include <prometheus/counter.h>
+#include <prometheus/gauge.h>
+#include <mutex>
+#include <atomic>
+#include <csignal>
+#include <memory>
+#include <cerrno>
+
+namespace pm = prometheus;
+//
+
+static const char* DEFAULT_STATE_DIR = "/var/lib/dmesg_exporter";
 static const char* STATE_FILE = "state.ini";
 
 struct State {
@@ -46,13 +60,38 @@ static std::string hostname_str();
 static std::vector<std::string> split(const std::string& s, char sep);
 static bool read_kmsg_record(int fd, Record& rec);
 
+// Prometheus objs
+struct MetricKey {
+  std::string subsystem;
+  std::string device;
+
+  bool operator<(const MetricKey& o) const {
+    if (subsystem < o.subsystem) return true;
+    if (subsystem > o.subsystem) return false;
+    return device < o.device;
+  }
+};
+
+static std::mutex g_metrics_mu;
+static pm::Family<pm::Counter>* g_errors_family = nullptr;
+static pm::Family<pm::Gauge>*   g_last_seq_family = nullptr;
+static pm::Gauge* g_last_seq_gauge = nullptr;
+static std::map<MetricKey, pm::Counter*> g_errors_by_dev;
+static std::atomic<bool> g_stop{false};
+
+static pm::Counter* get_error_counter(const std::string& host, const std::string& subsystem, const std::string& device);
+static void sig_handler(int);
+//
+
 int main (int argc, char** argv) {
   std::string state_dir = DEFAULT_STATE_DIR;
-  std::string measurement = "device_errors";
-  for (int i=1;i<argc;i++) {
+  std::string listen_addr = "0.0.0.0:9105";
+
+  for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    if (a=="--state-dir" && i+1<argc) state_dir = argv[++i];
-    else if (a=="--measurement" && i+1<argc) measurement = argv[++i];
+    if (a == "--state-dir" && i + 1 < argc) {
+      state_dir = argv[++i];
+    }
   }
 
   ::mkdir(state_dir.c_str(), 0755);
@@ -69,7 +108,7 @@ int main (int argc, char** argv) {
 
   int kfd = open_kmsg();
   if (kfd < 0) {
-    std::cerr << "[telegraf-dmesg] cannot open /dev/kmsg (need root or proper caps)\n";
+    std::cerr << "[dmesg-exporter] cannot open /dev/kmsg (need root or proper caps)\n";
     return 1;
   }
 
@@ -79,9 +118,44 @@ int main (int argc, char** argv) {
   std::string host = hostname_str();
   struct pollfd pfd { kfd, POLLIN, 0 };
 
-  while (true) {
-    int pr = ::poll(&pfd, 1, -1);
-    if (pr <= 0) continue;
+  // Prometheus init
+  pm::Exposer exposer{listen_addr};
+  auto registry = std::make_shared<pm::Registry>();
+
+  auto& errors_family = pm::BuildCounter()
+      .Name("dmesg_device_errors_total")
+      .Help("Total number of device-related error messages from /dev/kmsg")
+      .Register(*registry);
+
+  auto& last_seq_family = pm::BuildGauge()
+      .Name("dmesg_kmsg_last_seq")
+      .Help("Last processed /dev/kmsg sequence number")
+      .Register(*registry);
+
+  g_errors_family   = &errors_family;
+  g_last_seq_family = &last_seq_family;
+
+  auto& ls = last_seq_family.Add({{"host", host}});
+  g_last_seq_gauge = &ls;
+  g_last_seq_gauge->Set(static_cast<double>(st.last_seq));
+
+  exposer.RegisterCollectable(registry);
+  std::cerr << "[dmesg-exporter] listening for Prometheus scrapes on " << listen_addr << "\n";
+
+  std::signal(SIGINT, sig_handler);
+  std::signal(SIGTERM, sig_handler);
+  //
+
+  while (!g_stop.load()) {
+    int pr = ::poll(&pfd, 1, 1000);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      continue;
+    }
+    if (pr == 0) {
+      continue;
+    }
+
     if (pfd.revents & POLLIN) {
       Record r;
       if (!read_kmsg_record(kfd, r)) continue;
@@ -89,6 +163,11 @@ int main (int argc, char** argv) {
       if (r.seq > st.last_seq) {
         st.last_seq = r.seq;
         atomic_write_state(state_path, st);
+        if (g_last_seq_gauge) {
+          g_last_seq_gauge->Set(static_cast<double>(r.seq));
+        }
+      } else {
+        continue;
       }
 
       bool hit = false;
@@ -107,22 +186,13 @@ int main (int argc, char** argv) {
       }
       if (!hit) continue;
 
-      std::map<std::string,std::string> tags{
-        {"host", host},
-        {"device", device},
-        {"subsystem", subsystem},
-        {"source", "kmsg"}
-      };
-      std::map<std::string,std::string> fields{
-        {"count", "1i"},
-        {"pri", std::to_string(r.pri) + "i"},
-        {"seq", std::to_string(r.seq) + "i"},
-        {"msg", r.msg}
-      };
-//      emit_influx(measurement, tags, fields);
+      pm::Counter* c = get_error_counter(host, subsystem, device);
+      c->Increment();
     }
   }
 
+  ::close(kfd);
+  std::cerr << "[dmesg-exporter] exiting\n";
   return 0;
 }
 
@@ -234,3 +304,28 @@ static bool read_kmsg_record(int fd, Record& rec) {
     return true;
 }
 
+// Prometheus funcs
+
+static pm::Counter* get_error_counter(const std::string& host,
+                                      const std::string& subsystem,
+                                      const std::string& device) {
+  std::lock_guard<std::mutex> lk(g_metrics_mu);
+  MetricKey key{subsystem, device};
+  auto it = g_errors_by_dev.find(key);
+  if (it != g_errors_by_dev.end()) {
+    return it->second;
+  }
+  auto& ctr = g_errors_family->Add({
+      {"host", host},
+      {"device", device},
+      {"subsystem", subsystem},
+      {"source", "kmsg"},
+  });
+  g_errors_by_dev[key] = &ctr;
+  return &ctr;
+}
+
+static void sig_handler(int) {
+  g_stop.store(true);
+}
+//
