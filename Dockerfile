@@ -16,7 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Сборка prometheus-cpp
 WORKDIR /tmp/build
 
-RUN git clone --depth 1 --branch v1.3.0 https://github.com/jupp0r/prometheus-cpp.git
+RUN git clone \
+      --depth 1 \
+      --branch v1.3.0 \
+      --recurse-submodules \
+      --shallow-submodules \
+      https://github.com/jupp0r/prometheus-cpp.git
+
 
 WORKDIR /tmp/build/prometheus-cpp
 
