@@ -1,7 +1,7 @@
 # ============================
 # 1. Builder: компиляция
 # ============================
-FROM ubuntu:24.04 AS builder
+FROM debian:12-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
