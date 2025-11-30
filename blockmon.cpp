@@ -129,7 +129,7 @@ int main () {
   int kfd = open_kmsg();
   if (kfd < 0) {
     log_error("cannot open /dev/kmsg: " + last_errno_string() +
-              " (need root or CAP_SYSLOG/CAP_SYS_ADMIN)")
+              " (need root or CAP_SYSLOG/CAP_SYS_ADMIN)");
     return 1;
   }
   log_info("opened /dev/kmsg successfully");
