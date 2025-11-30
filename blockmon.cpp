@@ -28,7 +28,7 @@
 namespace pm = prometheus;
 //
 
-static const char* DEFAULT_STATE_DIR = "/var/lib/dmesg_exporter";
+static const char* DEFAULT_STATE_DIR = "/var/lib/blockmon_exporter";
 static const char* STATE_FILE = "state.ini";
 
 struct State {
@@ -49,6 +49,7 @@ struct Record {
   std::string msg;
 };
 
+static std::string getenv_or(const char* name, const char* def);
 static std::string trim(const std::string& s);
 static bool load_state(const std::string& path, State& st);
 static bool read_file(const std::string& path, std::string& out);
@@ -83,16 +84,9 @@ static pm::Counter* get_error_counter(const std::string& host, const std::string
 static void sig_handler(int);
 //
 
-int main (int argc, char** argv) {
-  std::string state_dir = DEFAULT_STATE_DIR;
-  std::string listen_addr = "0.0.0.0:9105";
-
-  for (int i = 1; i < argc; i++) {
-    std::string a = argv[i];
-    if (a == "--state-dir" && i + 1 < argc) {
-      state_dir = argv[++i];
-    }
-  }
+int main () {
+  std::string state_dir = getenv_or("DMESG_EXPORTER_STATE_DIR", DEFAULT_STATE_DIR);
+  std::string listen_addr = getenv_or("DMESG_EXPORTER_LISTEN_ADDR", "0.0.0.0:9105");
 
   ::mkdir(state_dir.c_str(), 0755);
   std::string state_path = state_dir + "/" + STATE_FILE;
@@ -108,7 +102,7 @@ int main (int argc, char** argv) {
 
   int kfd = open_kmsg();
   if (kfd < 0) {
-    std::cerr << "[dmesg-exporter] cannot open /dev/kmsg (need root or proper caps)\n";
+    std::cerr << "[blockmon-exporter] cannot open /dev/kmsg (need root or proper caps)\n";
     return 1;
   }
 
@@ -123,12 +117,12 @@ int main (int argc, char** argv) {
   auto registry = std::make_shared<pm::Registry>();
 
   auto& errors_family = pm::BuildCounter()
-      .Name("dmesg_device_errors_total")
+      .Name("block_device_errors_total")
       .Help("Total number of device-related error messages from /dev/kmsg")
       .Register(*registry);
 
   auto& last_seq_family = pm::BuildGauge()
-      .Name("dmesg_kmsg_last_seq")
+      .Name("block_kmsg_last_seq")
       .Help("Last processed /dev/kmsg sequence number")
       .Register(*registry);
 
@@ -140,7 +134,7 @@ int main (int argc, char** argv) {
   g_last_seq_gauge->Set(static_cast<double>(st.last_seq));
 
   exposer.RegisterCollectable(registry);
-  std::cerr << "[dmesg-exporter] listening for Prometheus scrapes on " << listen_addr << "\n";
+  std::cerr << "[blockmon-exporter] listening for Prometheus scrapes on " << listen_addr << "\n";
 
   std::signal(SIGINT, sig_handler);
   std::signal(SIGTERM, sig_handler);
@@ -192,8 +186,14 @@ int main (int argc, char** argv) {
   }
 
   ::close(kfd);
-  std::cerr << "[dmesg-exporter] exiting\n";
+  std::cerr << "[blockmon-exporter] exiting\n";
   return 0;
+}
+
+static std::string getenv_or(const char* name, const char* def) {
+  const char* v = std::getenv(name);
+  if (v && *v) return std::string(v);
+  return std::string(def);
 }
 
 static std::string trim(const std::string& s) {
