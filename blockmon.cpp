@@ -24,6 +24,7 @@
 #include <csignal>
 #include <memory>
 #include <cerrno>
+#include <cstring>
 
 namespace pm = prometheus;
 //
@@ -61,6 +62,13 @@ static std::string hostname_str();
 static std::vector<std::string> split(const std::string& s, char sep);
 static bool read_kmsg_record(int fd, Record& rec);
 
+// Logging
+static std::string last_errno_string();
+static void log_info(const std::string& msg);
+static void log_warn(const std::string& msg);
+static void log_error(const std::string& msg);
+static void log_debug(const std::string& msg);
+
 // Prometheus objs
 struct MetricKey {
   std::string subsystem;
@@ -87,11 +95,11 @@ static void sig_handler(int);
 int main () {
   std::string state_dir = getenv_or("DMESG_EXPORTER_STATE_DIR", DEFAULT_STATE_DIR);
   std::string listen_addr = getenv_or("DMESG_EXPORTER_LISTEN_ADDR", "0.0.0.0:9105");
-  log_info("state_dir=" + state_dir + ", state_path=" + state_path +
-         ", listen_addr=" + listen_addr);
 
   ::mkdir(state_dir.c_str(), 0755);
   std::string state_path = state_dir + "/" + STATE_FILE;
+  log_info("state_dir=" + state_dir + ", state_path=" + state_path +
+         ", listen_addr=" + listen_addr);
 
   State st{};
   State loaded{};
@@ -343,6 +351,27 @@ static bool read_kmsg_record(int fd, Record& rec) {
         rec.ts  = std::strtoull(parts[2].c_str(), nullptr, 10);
     }
     return true;
+}
+
+// Logging
+static std::string last_errno_string() {
+    return std::string(std::strerror(errno));
+}
+
+static void log_info(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] INFO  " << msg << "\n";
+}
+
+static void log_warn(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] WARN  " << msg << "\n";
+}
+
+static void log_error(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] ERROR " << msg << "\n";
+}
+
+static void log_debug(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] DEBUG " << msg << "\n";
 }
 
 // Prometheus funcs
