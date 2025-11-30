@@ -24,6 +24,7 @@
 #include <csignal>
 #include <memory>
 #include <cerrno>
+#include <cstring>
 
 namespace pm = prometheus;
 //
@@ -61,6 +62,13 @@ static std::string hostname_str();
 static std::vector<std::string> split(const std::string& s, char sep);
 static bool read_kmsg_record(int fd, Record& rec);
 
+// Logging
+static std::string last_errno_string();
+static void log_info(const std::string& msg);
+static void log_warn(const std::string& msg);
+static void log_error(const std::string& msg);
+static void log_debug(const std::string& msg);
+
 // Prometheus objs
 struct MetricKey {
   std::string subsystem;
@@ -90,21 +98,41 @@ int main () {
 
   ::mkdir(state_dir.c_str(), 0755);
   std::string state_path = state_dir + "/" + STATE_FILE;
+  log_info("state_dir=" + state_dir + ", state_path=" + state_path +
+         ", listen_addr=" + listen_addr);
 
   State st{};
   State loaded{};
-  load_state(state_path, loaded);
+  if (!load_state(state_path, loaded)) {
+      log_info("no state file, starting from scratch: " + state_path);
+  } else {
+      log_info("loaded state: boot_id=" + loaded.boot_id +
+               ", last_seq=" + std::to_string(loaded.last_seq));
+  }
   st.boot_id = read_boot_id();
-  if (st.boot_id == loaded.boot_id) st.last_seq = loaded.last_seq;
-  else st.last_seq = 0;
+  if (st.boot_id.empty()) {
+      log_warn("failed to read boot_id, state tracking may be broken");
+  }
+  if (st.boot_id == loaded.boot_id) {
+      st.last_seq = loaded.last_seq;
+      log_info("boot_id matches, resuming from seq=" + std::to_string(st.last_seq));
+  } else {
+      log_info("detected new boot_id: was=" + loaded.boot_id +
+               ", now=" + st.boot_id + ", resetting last_seq to 0");
+      st.last_seq = 0;
+  }
 
-  atomic_write_state(state_path, st);
+  if (!atomic_write_state(state_path, st)) {
+      log_error("failed to write state file: " + state_path + " : " + last_errno_string());
+  }
 
   int kfd = open_kmsg();
   if (kfd < 0) {
-    std::cerr << "[blockmon-exporter] cannot open /dev/kmsg (need root or proper caps)\n";
+    log_error("cannot open /dev/kmsg: " + last_errno_string() +
+              " (need root or CAP_SYSLOG/CAP_SYS_ADMIN)");
     return 1;
   }
+  log_info("opened /dev/kmsg successfully");
 
   std::vector<Pattern> patterns;
   build_patterns(patterns);
@@ -134,7 +162,8 @@ int main () {
   g_last_seq_gauge->Set(static_cast<double>(st.last_seq));
 
   exposer.RegisterCollectable(registry);
-  std::cerr << "[blockmon-exporter] listening for Prometheus scrapes on " << listen_addr << "\n";
+  log_info("prometheus exposer initialized on " + listen_addr +
+         " with metrics: block_device_errors_total, block_kmsg_last_seq");
 
   std::signal(SIGINT, sig_handler);
   std::signal(SIGTERM, sig_handler);
@@ -143,8 +172,11 @@ int main () {
   while (!g_stop.load()) {
     int pr = ::poll(&pfd, 1, 1000);
     if (pr < 0) {
-      if (errno == EINTR) continue;
-      continue;
+      if (errno == EINTR) {
+          continue;
+      }
+      log_error(std::string("poll(/dev/kmsg) failed: ") + last_errno_string());
+      break;
     }
     if (pr == 0) {
       continue;
@@ -156,7 +188,10 @@ int main () {
 
       if (r.seq > st.last_seq) {
         st.last_seq = r.seq;
-        atomic_write_state(state_path, st);
+        if (!atomic_write_state(state_path, st)) {
+            log_error("failed to update state file: " + state_path +
+                      ", last_seq=" + std::to_string(st.last_seq));
+        }
         if (g_last_seq_gauge) {
           g_last_seq_gauge->Set(static_cast<double>(r.seq));
         }
@@ -288,11 +323,25 @@ static std::vector<std::string> split(const std::string& s, char sep) {
 static bool read_kmsg_record(int fd, Record& rec) {
     char buf[8192];
     ssize_t n = ::read(fd, buf, sizeof(buf)-1);
-    if (n <= 0) return false;
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EINTR) {
+            return false;
+        }
+        log_warn(std::string("read(/dev/kmsg) failed: ") + last_errno_string());
+        return false;
+    }
+    if (n == 0) {
+        log_warn("read(/dev/kmsg) returned 0 bytes (EOF?)");
+        return false;
+    }
+
     buf[n] = 0;
     std::string line(buf);
     auto semi = line.find(';');
-    if (semi == std::string::npos) return false;
+    if (semi == std::string::npos) {
+        log_debug("kmsg line without ';', skipping: " + line);
+        return false;
+    }
     std::string header = line.substr(0, semi);
     rec.msg = trim(line.substr(semi+1));
     auto parts = split(header, ',');
@@ -302,6 +351,27 @@ static bool read_kmsg_record(int fd, Record& rec) {
         rec.ts  = std::strtoull(parts[2].c_str(), nullptr, 10);
     }
     return true;
+}
+
+// Logging
+static std::string last_errno_string() {
+    return std::string(std::strerror(errno));
+}
+
+static void log_info(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] INFO  " << msg << "\n";
+}
+
+static void log_warn(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] WARN  " << msg << "\n";
+}
+
+static void log_error(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] ERROR " << msg << "\n";
+}
+
+static void log_debug(const std::string& msg) {
+    std::cerr << "[blockmon-exporter] DEBUG " << msg << "\n";
 }
 
 // Prometheus funcs
